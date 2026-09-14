@@ -1,0 +1,193 @@
+import asyncio
+from telethon import TelegramClient, events
+from telethon.errors import (
+    FloodWaitError, AuthKeyDuplicatedError,
+    ChatWriteForbiddenError, UserNotParticipantError,
+    ChannelPrivateError, ChatAdminRequiredError
+)
+
+OWNER_IDS = [338631693]
+SPAM_TEXT = "Yo"
+TOTAL_MESSAGES = 500
+DELAY_BETWEEN = 0.5
+ANTI_SPAM_BOT_ID = 6157455819
+FLOOD_REST = 300
+BATCH_SIZE = 100
+BATCH_REST = 120
+
+ALLOWED_CHATS = [-1004490864031]
+
+ACCOUNTS_DATA = [
+    {"session": "google1", "api_id": 31659172, "api_hash": "cb46f8e4977111cd515a34e9ece4661b", "phone": "+989143402467"},
+    {"session": "google2", "api_id": 34199121, "api_hash": "ce37e72c7aa2d844e4034b360fa383b0", "phone": "+989333511372"},
+
+]
+
+clients = []
+running_chats = {}
+flooded_clients = set()
+chat_member_cache = {}
+
+def is_allowed_chat(chat_id):
+    return chat_id in ALLOWED_CHATS
+
+async def get_clients_in_chat(chat_id):
+    if chat_id in chat_member_cache:
+        return chat_member_cache[chat_id]
+
+    valid = []
+    for i, client in enumerate(clients):
+        try:
+            await client.get_entity(chat_id)
+            valid.append(client)
+            me = await client.get_me()
+            print(f"[✓] Acc #{i+1} ({me.first_name}) in chat {chat_id}")
+        except Exception as e:
+            me = await client.get_me()
+            print(f"[✗] Acc #{i+1} ({me.first_name}) can't access {chat_id}: {e}")
+
+    chat_member_cache[chat_id] = valid
+    print(f"[*] Chat {chat_id}: {len(valid)}/{len(clients)} accounts usable")
+    return valid
+
+async def rest_flooded_client(client, acc_num):
+    flooded_clients.add(id(client))
+    print(f"[~] Acc #{acc_num} resting {FLOOD_REST}s...")
+    await asyncio.sleep(FLOOD_REST)
+    flooded_clients.discard(id(client))
+    print(f"[+] Acc #{acc_num} back in pool!")
+
+async def round_robin_spam(chat_id, total, text, delay):
+    all_clients = await get_clients_in_chat(chat_id)
+
+    if not all_clients:
+        print(f"[!] No accounts can access chat {chat_id}!")
+        try:
+            await clients[0].send_message(OWNER_IDS[0], f"⚠️ هیچ اکانتی به گروه {chat_id} دسترسی نداره!")
+        except:
+            pass
+        return
+
+    running_chats[chat_id] = {"is_running": True, "sent_count": 0}
+    banned_clients = set()
+
+    print(f"[*] Chat {chat_id}: starting {total} msgs with {len(all_clients)} accounts...")
+
+    i = 0
+    while i < total:
+        if not running_chats.get(chat_id, {}).get("is_running"):
+            print(f"[!] Chat {chat_id} stopped.")
+            break
+
+        active = [c for c in all_clients if id(c) not in flooded_clients and id(c) not in banned_clients]
+
+        if not active:
+            print(f"[!] No active accounts for chat {chat_id}!")
+            break
+
+        current = active[i % len(active)]
+        acc_num = clients.index(current) + 1
+
+        try:
+            await current.send_message(chat_id, text)
+            running_chats[chat_id]["sent_count"] += 1
+            sent = running_chats[chat_id]["sent_count"]
+            print(f"[Chat {chat_id}] [{sent}/{total}] Acc #{acc_num} | Remaining: {total - sent}")
+            await asyncio.sleep(delay)
+            i += 1
+
+            if sent % BATCH_SIZE == 0 and sent < total:
+                print(f"[~] {BATCH_SIZE} msgs done. Resting {BATCH_REST}s...")
+                await asyncio.sleep(BATCH_REST)
+
+        except FloodWaitError as e:
+            print(f"[!] Acc #{acc_num} flooded! Rest {FLOOD_REST}s, others continue.")
+            asyncio.create_task(rest_flooded_client(current, acc_num))
+
+        except (ChatWriteForbiddenError, UserNotParticipantError, ChannelPrivateError, ChatAdminRequiredError):
+            me = await current.get_me()
+            print(f"[~] Acc #{acc_num} ({me.first_name}) banned from {chat_id}.")
+            banned_clients.add(id(current))
+            if chat_id in chat_member_cache and current in chat_member_cache[chat_id]:
+                chat_member_cache[chat_id].remove(current)
+
+        except AuthKeyDuplicatedError:
+            print(f"[CRITICAL] Acc #{acc_num} session invalid!")
+            running_chats[chat_id]["is_running"] = False
+            break
+
+        except Exception as e:
+            print(f"[!] Error Acc #{acc_num}: {e}")
+            await asyncio.sleep(0.5)
+            i += 1
+
+    sent = running_chats.get(chat_id, {}).get("sent_count", 0)
+    running_chats.pop(chat_id, None)
+    print(f"[+] Chat {chat_id} done. Total sent: {sent}")
+
+    try:
+        await clients[0].send_message(OWNER_IDS[0], f"✅ Chat {chat_id} finished! Sent: {sent}")
+    except Exception as e:
+        print(f"[!] Notify failed: {e}")
+
+async def main():
+    global clients
+
+    for acc in ACCOUNTS_DATA:
+        client = TelegramClient(acc["session"], acc["api_id"], acc["api_hash"])
+        await client.start(phone=acc["phone"])
+        clients.append(client)
+        me = await client.get_me()
+        print(f"[✓] Logged in: {me.first_name} (ID: {me.id})")
+
+    owner_client = clients[0]
+
+    @owner_client.on(events.NewMessage(from_users=OWNER_IDS))
+    async def command_handler(event):
+        chat_id = event.chat_id
+
+        if not is_allowed_chat(chat_id):
+            return
+
+        if event.raw_text.startswith('.startgacha'):
+            await event.delete()
+            if running_chats.get(chat_id, {}).get("is_running"):
+                print(f"[!] Chat {chat_id} already running.")
+                return
+            parts = event.raw_text.split()
+            total = min(int(parts[1]), 500) if len(parts) > 1 and parts[1].isdigit() else TOTAL_MESSAGES
+            asyncio.create_task(round_robin_spam(chat_id, total, SPAM_TEXT, DELAY_BETWEEN))
+
+        elif event.raw_text == '.stop':
+            await event.delete()
+            if chat_id in running_chats:
+                running_chats[chat_id]["is_running"] = False
+                print(f"[!] Chat {chat_id} stopped.")
+
+        elif event.raw_text == '.status':
+            if running_chats.get(chat_id, {}).get("is_running"):
+                sent = running_chats[chat_id]["sent_count"]
+                flooded = len(flooded_clients)
+                await event.reply(f"🟢 Running | Sent: {sent} | Flooded: {flooded}")
+            else:
+                await event.reply("🔴 Stopped")
+
+    @owner_client.on(events.NewMessage())
+    async def anti_spam_handler(event):
+        chat_id = event.chat_id
+        if not is_allowed_chat(chat_id):
+            return
+        if event.sender_id == ANTI_SPAM_BOT_ID and running_chats.get(chat_id, {}).get("is_running"):
+            running_chats[chat_id]["is_running"] = False
+            print(f"[!] Anti-spam in {chat_id}! Stopped.")
+            try:
+                await owner_client.send_message(OWNER_IDS[0], f"⛔ Anti-spam in {chat_id}! Stopped.")
+            except:
+                pass
+
+    print(f"\n[READY] Watching: {ALLOWED_CHATS}")
+    print("[READY] .startgacha [1-500] | .stop | .status")
+    await asyncio.gather(*(c.run_until_disconnected() for c in clients))
+
+if __name__ == '__main__':
+    asyncio.run(main())
